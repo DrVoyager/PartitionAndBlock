@@ -1,5 +1,4 @@
 *.slurm
 __pycache__/
 *.pyc
-checkpoints/
 data/

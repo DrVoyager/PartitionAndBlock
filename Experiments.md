@@ -87,3 +87,38 @@ Key milestones:
 - P&B model broke through the 84.86% plateau with extended training, eventually outperforming the baseline.
 - The accuracy gap is +1.32% in favor of P&B, likely due to the extra parameters in the dual-branch + merging architecture.
 - Both models received identical data augmentation and optimizer settings.
+
+---
+
+## Experiment 3: Retrain with checkpoints in `code/checkpoints/` (76 epochs)
+
+**Date:** May 28, 2026
+**Cluster:** hpc.cpp.edu (GPU: Tesla P100)
+**Job IDs:** 41047 (P&B), 41048 (baseline)
+**Scripts:** `code/train_pb.py`, `code/train_baseline.py`
+
+### Configuration
+- Same as Experiment 2.
+- Checkpoints saved to `code/checkpoints/` (relative path from `code/`).
+
+### P&B Model Results
+- **Best validation accuracy:** 88.62%
+- **Final validation accuracy:** 88.51% (epoch 76)
+- **Training time:** 17m 20s
+
+### Baseline MobileNet V1 Results
+- **Best validation accuracy:** 88.41%
+- **Final validation accuracy:** 88.41% (epoch 76)
+- **Training time:** 20m 24s
+
+### Comparison
+
+| Model | Best Accuracy | Parameters |
+|-------|-------------|------------|
+| Baseline MobileNet V1 | 88.41% | 2,948,426 |
+| P&B Model | **88.62%** | ~14,200,000 |
+
+### Notes
+- P&B (+0.21%) retained its advantage over baseline, though the gap narrowed compared to Experiment 2 (+1.32%).
+- Baseline improved from 87.52% → 88.41%, likely due to random seed variation.
+- Checkpoints stored in `code/checkpoints/` and tracked via `.gitignore`.
