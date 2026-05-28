@@ -61,7 +61,7 @@ def main():
     print('Loading trained model...')
     model = PartitionAndBlockingModel(num_classes=10).to(device)
 
-    checkpoint = torch.load('../checkpoints/best_model.pth', map_location=device)
+    checkpoint = torch.load('checkpoints/best_model.pth', map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     print(f'Model loaded from epoch {checkpoint["epoch"]} with best accuracy: {checkpoint["best_acc"]:.2f}%')
 
