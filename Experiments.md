@@ -81,7 +81,7 @@ Key milestones:
 | Model | Best Accuracy | Parameters |
 |-------|-------------|------------|
 | Baseline MobileNet V1 | 87.52% | 2,948,426 |
-| P&B Model | **88.84%** | ~14,200,000 |
+| P&B Model | **88.84%** | 4,833,002 |
 
 ### Notes
 - P&B model broke through the 84.86% plateau with extended training, eventually outperforming the baseline.
@@ -116,9 +116,28 @@ Key milestones:
 | Model | Best Accuracy | Parameters |
 |-------|-------------|------------|
 | Baseline MobileNet V1 | 88.41% | 2,948,426 |
-| P&B Model | **88.62%** | ~14,200,000 |
+| P&B Model | **88.62%** | 4,833,002 |
+
+### Test Evaluation (local, MPS)
+- **Overall test accuracy:** 88.62% (8862/10000)
+- **Checkpoint loaded:** epoch 72, best validation accuracy 88.62%
+
+#### Per-class Accuracy
+| Class  | Accuracy |
+|--------|---------|
+| plane  | 89.30%  |
+| car    | 95.00%  |
+| bird   | 85.90%  |
+| cat    | 77.30%  |
+| deer   | 88.50%  |
+| dog    | 82.70%  |
+| frog   | 89.90%  |
+| horse  | 93.00%  |
+| ship   | 93.40%  |
+| truck  | 91.20%  |
 
 ### Notes
 - P&B (+0.21%) retained its advantage over baseline, though the gap narrowed compared to Experiment 2 (+1.32%).
 - Baseline improved from 87.52% → 88.41%, likely due to random seed variation.
+- P&B model has 4,833,002 total parameters (all trainable).
 - Checkpoints stored in `code/checkpoints/` and tracked via `.gitignore`.
