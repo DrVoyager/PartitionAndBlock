@@ -92,8 +92,8 @@ def main():
     num_epochs = 76
     best_acc = 0.0
 
-    if os.path.exists('checkpoints/baseline_mobilenetv1.pth'):
-        checkpoint = torch.load('checkpoints/baseline_mobilenetv1.pth', map_location=device)
+    if os.path.exists('../checkpoints/baseline_mobilenetv1.pth'):
+        checkpoint = torch.load('../checkpoints/baseline_mobilenetv1.pth', map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         best_acc = checkpoint.get('val_acc', 0.0)
         start_epoch = checkpoint.get('epoch', 0)
@@ -113,12 +113,12 @@ def main():
         if val_acc > best_acc:
             best_acc = val_acc
 
-    os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('../checkpoints', exist_ok=True)
     torch.save({
         'epoch': num_epochs,
         'model_state_dict': model.state_dict(),
         'val_acc': val_acc,
-    }, 'checkpoints/baseline_mobilenetv1.pth')
+    }, '../checkpoints/baseline_mobilenetv1.pth')
 
     print(f'\nTraining completed!')
     print(f'Best validation accuracy: {best_acc:.2f}%')

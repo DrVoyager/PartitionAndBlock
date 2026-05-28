@@ -158,8 +158,8 @@ def main():
     num_epochs = 76
     best_acc = 0.0
 
-    if os.path.exists('checkpoints/best_model.pth'):
-        checkpoint = torch.load('checkpoints/best_model.pth', map_location=device)
+    if os.path.exists('../checkpoints/best_model.pth'):
+        checkpoint = torch.load('../checkpoints/best_model.pth', map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         best_acc = checkpoint['best_acc']
@@ -168,7 +168,7 @@ def main():
     else:
         start_epoch = 0
 
-    os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('../checkpoints', exist_ok=True)
 
     print('\nStarting training...')
     for epoch in range(start_epoch, num_epochs):
@@ -194,7 +194,7 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_acc': best_acc,
-            }, 'checkpoints/best_model.pth')
+            }, '../checkpoints/best_model.pth')
             print(f'  Best model saved with accuracy: {best_acc:.2f}%')
 
     print(f'\nTraining completed!')
