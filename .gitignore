@@ -1,4 +1,9 @@
+*.pyc
 *.slurm
 __pycache__/
-*.pyc
+checkpoints/
 data/
+hpc_jobs/
+results_*/
+slurm_logs/
+training_log.txt
