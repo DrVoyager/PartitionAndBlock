@@ -1,13 +1,8 @@
 """
-Blocked-smashed-representation inversion attack for PartitionAndBlockingModel.
+Full-smashed-representation inversion attack for baseline MobileNetV1.
 
-The attacker observes only the noncentral smashed representation:
-
-    target_blocked_s = mask * victim.client_model(x)
-
-and recovers x_hat by matching only the unmasked smashed features. With the
-corrected P&B model, victim.client_model(x) has shape [B, 32, 32, 32] and the
-protected central partition is h=11:21, w=11:21.
+Use --split-children 3 to attack the MobileNetV1 stem output [B, 32, 32, 32],
+which is comparable to the corrected P&B client output.
 """
 
 import argparse
@@ -21,19 +16,76 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
 
-from mobilenet_v1 import MobileNetV1ClientModel, PartitionAndBlockingModel
 from util import TV, get_examples_by_class, l2loss, normalize
 
 
+DEFAULT_CHECKPOINT_DIR = Path("checkpoints_mobilenetv1")
+DEFAULT_CHECKPOINT_NAME = "mobilenetv1_attack_victim.pth"
 MIN_ATTACK_MODEL_ACCURACY = 50.0
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR10_STD = (0.2023, 0.1994, 0.2010)
+SPLIT_PRESETS = {
+    "stem": 3,
+    "early64": 4,
+    "pb-spatial": 5,
+}
 
 
 def cifar10_normalize_tensor(images: torch.Tensor) -> torch.Tensor:
     mean = images.new_tensor(CIFAR10_MEAN).view(1, 3, 1, 1)
     std = images.new_tensor(CIFAR10_STD).view(1, 3, 1, 1)
     return (images - mean) / std
+
+
+class MobileNetV1(nn.Module):
+    def __init__(self, num_classes: int = 10):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            self._make_depthwise(32, 64, stride=1),
+            self._make_depthwise(64, 128, stride=2),
+            self._make_depthwise(128, 128, stride=1),
+            self._make_depthwise(128, 256, stride=2),
+            self._make_depthwise(256, 256, stride=1),
+            self._make_depthwise(256, 512, stride=2),
+            self._make_depthwise(512, 512, stride=1),
+            self._make_depthwise(512, 512, stride=1),
+            self._make_depthwise(512, 512, stride=1),
+            self._make_depthwise(512, 512, stride=1),
+            self._make_depthwise(512, 1024, stride=2),
+            self._make_depthwise(1024, 1024, stride=1),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(1024, num_classes),
+        )
+
+    def _make_depthwise(self, in_channels: int, out_channels: int, stride: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=stride, padding=1, groups=in_channels, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.features(x))
+
+
+class MobileNetV1ClientModel(nn.Module):
+    def __init__(self, mobilenet: MobileNetV1, split_children: int = 3):
+        super().__init__()
+        if not 1 <= split_children <= len(mobilenet.features):
+            raise ValueError(f"split_children must be between 1 and {len(mobilenet.features)}.")
+        self.features = nn.Sequential(*list(mobilenet.features.children())[:split_children])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.features(x)
 
 
 @torch.no_grad()
@@ -71,18 +123,47 @@ def restored_input_accuracy(
     return 100.0 * correct / max(total, 1), correct, total
 
 
-def train_partition_model(
-    model: PartitionAndBlockingModel,
+def load_model_checkpoint(model: nn.Module, checkpoint_path: Path, device: torch.device) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        model.load_state_dict(checkpoint)
+    print(f"Loaded checkpoint: {checkpoint_path}")
+
+
+def find_existing_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
+    if not checkpoint_dir.exists():
+        return None
+
+    for checkpoint_name in (DEFAULT_CHECKPOINT_NAME, "baseline_mobilenetv1.pth"):
+        checkpoint_path = checkpoint_dir / checkpoint_name
+        if checkpoint_path.exists():
+            return checkpoint_path
+
+    checkpoints = sorted(checkpoint_dir.glob("*.pth"), key=lambda path: path.stat().st_mtime, reverse=True)
+    return checkpoints[0] if checkpoints else None
+
+
+def save_model_checkpoint(model: nn.Module, checkpoint_path: Path, epochs: int, test_acc: float) -> None:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"epoch": epochs, "model_state_dict": model.state_dict(), "test_acc": test_acc}, checkpoint_path)
+    print(f"Saved checkpoint: {checkpoint_path}")
+
+
+def train_mobilenetv1(
+    model: MobileNetV1,
     trainset,
     testset,
     device: torch.device,
     epochs: int = 10,
     batch_size: int = 128,
     lr: float = 1e-3,
-) -> None:
+) -> float:
     loader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, amsgrad=True)
     criterion = nn.CrossEntropyLoss()
+    test_acc = 0.0
 
     for epoch in range(epochs):
         model.train()
@@ -90,41 +171,19 @@ def train_partition_model(
         for images, labels in loader:
             images = images.to(device)
             labels = labels.to(device)
-
             optimizer.zero_grad(set_to_none=True)
-            logits = model(images)
-            loss = criterion(logits, labels)
+            loss = criterion(model(images), labels)
             loss.backward()
             optimizer.step()
-
             running_loss += loss.item()
 
         test_acc = accuracy(model, testset, device)
-        print(
-            f"Epoch {epoch + 1:02d}/{epochs} | "
-            f"loss={running_loss / len(loader):.4f} | test_acc={test_acc:.2f}%"
-        )
+        print(f"Epoch {epoch + 1:02d}/{epochs} | loss={running_loss / len(loader):.4f} | test_acc={test_acc:.2f}%")
+
+    return test_acc
 
 
-def central_partition_bounds(model: PartitionAndBlockingModel, s: torch.Tensor) -> Tuple[int, int, int, int]:
-    return model.central_partition_bounds(s)
-
-
-def noncentral_smashed_mask(model: PartitionAndBlockingModel, s: torch.Tensor) -> torch.Tensor:
-    mask = torch.ones_like(s)
-    h_start, h_end, w_start, w_end = central_partition_bounds(model, s)
-    mask[:, :, h_start:h_end, w_start:w_end] = 0.0
-    return mask
-
-
-def masked_feature_mse(pred_s: torch.Tensor, target_s: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    squared_error = ((pred_s - target_s) * mask).pow(2)
-    denom = mask.sum().clamp_min(1.0)
-    return squared_error.sum() / denom
-
-
-def blocked_smashed_inversion_attack(
-    partition_model: PartitionAndBlockingModel,
+def full_smashed_inversion_attack(
     clone_client: nn.Module,
     target_s: torch.Tensor,
     input_size: Tuple[int, ...],
@@ -133,16 +192,16 @@ def blocked_smashed_inversion_attack(
     main_iters: int = 1000,
     input_iters: int = 100,
     model_iters: int = 100,
-    lr_input: float = 1e-3,
-    lr_model: float = 1e-3,
-    steal_model: bool = True,
-    clamp: bool = True,
-    log_every: int = 50,
     input_change_tol: float = 1e-7,
     main_convergence_patience: int = 5,
     min_main_iters: int = 50,
     disable_input_convergence: bool = False,
     input_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    lr_input: float = 1e-3,
+    lr_model: float = 1e-3,
+    steal_model: bool = True,
+    clamp: bool = True,
+    log_every: int = 50,
 ) -> torch.Tensor:
     if input_iters < 1:
         raise ValueError("input_iters must be at least 1.")
@@ -154,20 +213,15 @@ def blocked_smashed_inversion_attack(
         raise ValueError("min_main_iters must be at least 1.")
 
     device = target_s.device
-    partition_model = partition_model.to(device)
     clone_client = clone_client.to(device)
-
-    target_s = target_s.detach()
-    mask = noncentral_smashed_mask(partition_model, target_s).detach()
-    observed_target_s = target_s * mask
-
     x_hat = torch.empty(input_size, device=device).fill_(0.5).requires_grad_(True)
-
     input_opt = torch.optim.Adam([x_hat], lr=lr_input, amsgrad=True)
     model_opt: Optional[torch.optim.Optimizer] = None
     if steal_model:
         model_opt = torch.optim.Adam(clone_client.parameters(), lr=lr_model, amsgrad=True)
 
+    mse = nn.MSELoss()
+    target_s = target_s.detach()
     previous_x_hat = x_hat.detach().clone()
     stable_main_steps = 0
 
@@ -176,12 +230,9 @@ def blocked_smashed_inversion_attack(
         for _ in range(input_iters):
             input_opt.zero_grad(set_to_none=True)
             model_input = input_transform(x_hat) if input_transform is not None else x_hat
-            pred_s = clone_client(model_input)
-            match_loss = masked_feature_mse(pred_s, observed_target_s, mask)
-            loss = match_loss + lambda_tv * TV(x_hat) + lambda_l2 * l2loss(x_hat)
+            loss = mse(clone_client(model_input), target_s) + lambda_tv * TV(x_hat) + lambda_l2 * l2loss(x_hat)
             loss.backward()
             input_opt.step()
-
             if clamp:
                 with torch.no_grad():
                     x_hat.clamp_(0.0, 1.0)
@@ -193,16 +244,14 @@ def blocked_smashed_inversion_attack(
                 model_opt.zero_grad(set_to_none=True)
                 detached_x = x_hat.detach()
                 model_input = input_transform(detached_x) if input_transform is not None else detached_x
-                pred_s = clone_client(model_input)
-                model_loss = masked_feature_mse(pred_s, observed_target_s, mask)
+                model_loss = mse(clone_client(model_input), target_s)
                 model_loss.backward()
                 model_opt.step()
 
         clone_client.eval()
         with torch.no_grad():
             model_input = input_transform(x_hat) if input_transform is not None else x_hat
-            pred_s = clone_client(model_input)
-            noncentral_loss = masked_feature_mse(pred_s, observed_target_s, mask).item()
+            match_loss = mse(clone_client(model_input), target_s).item()
             input_change = (x_hat.detach() - previous_x_hat).abs().mean().item()
 
         if input_change <= input_change_tol:
@@ -214,7 +263,7 @@ def blocked_smashed_inversion_attack(
         if log_every and ((main_iter + 1) % log_every == 0 or main_iter == 0):
             print(
                 f"iter {main_iter + 1:04d}/{main_iters} | "
-                f"noncentral_smashed_mse={noncentral_loss:.6f} | "
+                f"smashed_mse={match_loss:.6f} | "
                 f"mean_abs_input_change={input_change:.8f} | "
                 f"stable_main_steps={stable_main_steps}/{main_convergence_patience}"
             )
@@ -226,7 +275,7 @@ def blocked_smashed_inversion_attack(
         ):
             print(
                 f"Converged at iter {main_iter + 1:04d}/{main_iters}: "
-                f"noncentral_smashed_mse={noncentral_loss:.6f}, "
+                f"smashed_mse={match_loss:.6f}, "
                 f"mean_abs_input_change={input_change:.8f}, "
                 f"stable_main_steps={stable_main_steps}/{main_convergence_patience}, "
                 f"input_change_tol={input_change_tol:.2e}"
@@ -242,25 +291,26 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-classes", type=int, default=10)
+    parser.add_argument("--split-preset", choices=tuple(SPLIT_PRESETS), default="stem")
+    parser.add_argument("--split-children", type=int, default=None)
     parser.add_argument("--main-iters", type=int, default=1000)
     parser.add_argument("--input-iters", type=int, default=100)
     parser.add_argument("--model-iters", type=int, default=100)
+    parser.add_argument("--input-change-tol", "--input-loss-tol", dest="input_change_tol", type=float, default=1e-7)
+    parser.add_argument("--main-convergence-patience", "--convergence-patience", dest="main_convergence_patience", type=int, default=5)
+    parser.add_argument("--min-main-iters", type=int, default=50)
+    parser.add_argument("--disable-input-convergence", action="store_true")
     parser.add_argument("--lambda-tv", type=float, default=0.1)
     parser.add_argument("--lambda-l2", type=float, default=0.0)
-    parser.add_argument("--input-change-tol", "--main-loss-tol", dest="input_change_tol", type=float, default=1e-7,
-                        help="Stop early when the mean absolute change in reconstructed input stays below this tolerance.")
-    parser.add_argument("--main-convergence-patience", type=int, default=5,
-                        help="Number of consecutive stable main iterations required for convergence.")
-    parser.add_argument("--min-main-iters", type=int, default=50,
-                        help="Minimum number of main iterations before convergence can stop the attack.")
-    parser.add_argument("--disable-input-convergence", action="store_true",
-                        help="Ignore reconstructed-input convergence and run until main-iters is reached.")
-    parser.add_argument("--known-client", action="store_true",
-                        help="Use a copy of the victim client instead of stealing a random clone.")
-    parser.add_argument("--save-dir", type=str, default="results_partition_blocked_attack")
-    parser.add_argument("--checkpoint", type=str, default="", help="Optional checkpoint for a trained PartitionAndBlockingModel.")
-    parser.add_argument("--require-cuda", action="store_true", help="Stop before running if CUDA is not available.")
+    parser.add_argument("--known-client", action="store_true")
+    parser.add_argument("--save-dir", type=str, default="results_mobilenetv1_full_smashed_attack")
+    parser.add_argument("--checkpoint", type=str, default="")
+    parser.add_argument("--checkpoint-dir", type=str, default=str(DEFAULT_CHECKPOINT_DIR))
+    parser.add_argument("--require-cuda", action="store_true")
     args = parser.parse_args()
+
+    if args.split_children is None:
+        args.split_children = SPLIT_PRESETS[args.split_preset]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     if args.require_cuda and device.type != "cuda":
@@ -276,18 +326,19 @@ def main() -> None:
     ])
     eval_testset = datasets.CIFAR10(args.data_root, download=True, train=False, transform=eval_transform)
 
-    victim = PartitionAndBlockingModel(num_classes=args.num_classes).to(device)
+    victim = MobileNetV1(num_classes=args.num_classes).to(device)
 
     if args.checkpoint:
-        checkpoint = torch.load(args.checkpoint, map_location=device)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            victim.load_state_dict(checkpoint["model_state_dict"])
-        else:
-            victim.load_state_dict(checkpoint)
-        print(f"Loaded checkpoint: {args.checkpoint}")
+        load_model_checkpoint(victim, Path(args.checkpoint), device)
     else:
-        print("Training victim PartitionAndBlockingModel...")
-        train_partition_model(victim, trainset, testset, device, epochs=args.epochs, batch_size=args.batch_size)
+        checkpoint_dir = Path(args.checkpoint_dir)
+        existing_checkpoint = find_existing_checkpoint(checkpoint_dir)
+        if existing_checkpoint is not None:
+            load_model_checkpoint(victim, existing_checkpoint, device)
+        else:
+            print(f"No MobileNetV1 weights found in {checkpoint_dir}; training victim model...")
+            test_acc = train_mobilenetv1(victim, trainset, testset, device, epochs=args.epochs, batch_size=args.batch_size)
+            save_model_checkpoint(victim, checkpoint_dir / DEFAULT_CHECKPOINT_NAME, args.epochs, test_acc)
 
     victim.eval()
     victim_acc = accuracy(victim, eval_testset, device, batch_size=args.batch_size)
@@ -299,32 +350,32 @@ def main() -> None:
             "Stopping before attack."
         )
 
+    victim_client = MobileNetV1ClientModel(victim, split_children=args.split_children).to(device)
+    victim_client.eval()
+
     images = torch.stack([get_examples_by_class(testset, c, count=1) for c in range(args.num_classes)], dim=0).to(device)
     true_labels = torch.arange(args.num_classes, device=device)
 
     with torch.no_grad():
-        target_s = victim.client_model(cifar10_normalize_tensor(images))
-        mask = noncentral_smashed_mask(victim, target_s)
-        observed_target_s = target_s * mask
+        target_s = victim_client(cifar10_normalize_tensor(images))
 
-    h_start, h_end, w_start, w_end = central_partition_bounds(victim, target_s)
-    print(f"Full smashed representation shape: {tuple(target_s.shape)}")
-    print(f"Central protected partition removed: h={h_start}:{h_end}, w={w_start}:{w_end}")
-    print(f"Observed noncentral smashed representation shape: {tuple(observed_target_s.shape)}")
-    print(f"Observed feature ratio: {mask.sum().item() / mask.numel():.4f}")
+    print("Victim model: MobileNet V1")
+    print(f"Split preset: {args.split_preset}")
+    print(f"Client split children: {args.split_children}")
+    print(f"Target full smashed representation shape: {tuple(target_s.shape)}")
     print(f"Attack regularization: lambda_tv={args.lambda_tv:g}, lambda_l2={args.lambda_l2:g}")
 
     if args.known_client:
-        clone_client = copy.deepcopy(victim.client_model).to(device)
+        clone_client = copy.deepcopy(victim_client).to(device)
         steal_model = False
         print("Attack mode: known client; optimizing only x_hat.")
     else:
-        clone_client = MobileNetV1ClientModel().to(device)
+        random_victim = MobileNetV1(num_classes=args.num_classes).to(device)
+        clone_client = MobileNetV1ClientModel(random_victim, split_children=args.split_children).to(device)
         steal_model = True
         print("Attack mode: random clone client; optimizing both x_hat and clone_client.")
 
-    result = blocked_smashed_inversion_attack(
-        partition_model=victim,
+    result = full_smashed_inversion_attack(
         clone_client=clone_client,
         target_s=target_s,
         input_size=tuple(images.size()),
@@ -333,12 +384,12 @@ def main() -> None:
         main_iters=args.main_iters,
         input_iters=args.input_iters,
         model_iters=args.model_iters,
-        steal_model=steal_model,
         input_change_tol=args.input_change_tol,
         main_convergence_patience=args.main_convergence_patience,
         min_main_iters=args.min_main_iters,
         disable_input_convergence=args.disable_input_convergence,
         input_transform=cifar10_normalize_tensor,
+        steal_model=steal_model,
     )
 
     save_dir = Path(args.save_dir)
