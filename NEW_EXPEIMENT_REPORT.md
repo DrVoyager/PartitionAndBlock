@@ -615,3 +615,66 @@ Interpretation:
    more redundant `(32, 32, 32)` stem representation, so missing only the
    central `10 x 10` spatial block does not reproduce the older paper's
    `0.018 -> 0.061` known-client MSE pattern.
+
+## 13. Baseline Unknown-Client Longer-Iteration L2 Sweep
+
+**Date:** 2026-06-15  
+**SLURM job:** `41218`  
+**Remote run directory:** `/data03/home/yongzhiwang/develop/partition_and_blocking_20260604/attack_runs/baseline_unknown_long_l2_sweep_20260615_064717/`  
+**Local output directory:** `partition_and_blocking_20260604/attack_runs/baseline_unknown_long_l2_sweep_20260615_064717/`
+
+This follow-up reran only the Baseline MobileNetV1 full-smashed
+unknown-client attack with a longer fixed attack schedule. The prior corrected
+run stopped by reconstructed-input convergence after 50 main iterations and
+reported average pixel MSE `0.069509`. To test whether additional optimization
+and a small image L2 prior can reduce reconstruction error, this sweep disabled
+input-convergence stopping and ran all settings to 1000 main iterations.
+
+Common settings:
+
+| Setting | Value |
+| ------- | ----: |
+| Attack | Baseline MobileNetV1 full-smashed |
+| Client knowledge | Unknown |
+| `main-iters` | 1000 |
+| `input-iters` | 100 |
+| `model-iters` | 100 |
+| `disable-input-convergence` | Yes |
+| `lambda-tv` | 0.1 |
+| CUDA required | Yes |
+| Number of target images | 10 |
+
+Sweep results:
+
+| `lambda-l2` | Final Smashed MSE | Average Pixel MSE | Restored-Input Clone Accuracy |
+| ----------: | ----------------: | ----------------: | ----------------------------: |
+| 0 | 0.001323 | 0.067652 | 10.00% (1/10) |
+| 0.0001 | 0.001562 | 0.064690 | 10.00% (1/10) |
+| 0.001 | 0.001323 | 0.067805 | 10.00% (1/10) |
+| 0.01 | 0.001865 | 0.065224 | 10.00% (1/10) |
+
+Per-image pixel MSE:
+
+| Class Index | L2=0 | L2=0.0001 | L2=0.001 | L2=0.01 |
+| ----------: | ---: | --------: | -------: | ------: |
+| 0 | 0.068285 | 0.065672 | 0.060362 | 0.067239 |
+| 1 | 0.100951 | 0.089537 | 0.108298 | 0.096581 |
+| 2 | 0.041514 | 0.043393 | 0.041074 | 0.040770 |
+| 3 | 0.036628 | 0.036349 | 0.038513 | 0.035641 |
+| 4 | 0.038145 | 0.044920 | 0.045335 | 0.035264 |
+| 5 | 0.057026 | 0.051608 | 0.060336 | 0.054307 |
+| 6 | 0.030217 | 0.030322 | 0.030984 | 0.029376 |
+| 7 | 0.120716 | 0.113134 | 0.124508 | 0.114785 |
+| 8 | 0.115508 | 0.109747 | 0.104984 | 0.112817 |
+| 9 | 0.067527 | 0.062219 | 0.063651 | 0.065458 |
+
+Interpretation:
+
+1. Running the unknown-client baseline attack for 1000 fixed main iterations
+   improves average pixel MSE only slightly, from `0.069509` to `0.067652`
+   when `lambda-l2 = 0`.
+2. A very small image L2 prior helps modestly in this sweep. The best setting
+   was `lambda-l2 = 0.0001`, which reduced average pixel MSE to `0.064690`.
+3. Larger L2 values did not continue improving the result. This supports using
+   only a small L2 prior for this unknown-client tuning case, while avoiding the
+   earlier large `lambda-l2 = 1.0` setting that caused reconstruction collapse.
