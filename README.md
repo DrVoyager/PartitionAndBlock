@@ -1,29 +1,38 @@
-# Partition and Blocking CIFAR-10 Experiments
+# Partition and Block CIFAR-10 Experiments
 
-This repository contains PyTorch code for evaluating Partition and Blocking
+This repository contains PyTorch code for evaluating Partition and Block
 (P&B) split-inference defenses and UnSplit-style reconstruction attacks on
 CIFAR-10.
 
+P&B partitions smashed data and hides a centered spatial block from the
+untrusted server path. The protected block is processed by protected server
+layers, while the remaining smashed representation is processed by the ordinary
+server path and later merged for classification.
+
 ## What is Included
 
-- `mobilenet_v1.py`: corrected P&B model definition. The client is the
-  MobileNetV1 stem and produces smashed features with shape `(32, 32, 32)`.
-  The central `(32, 10, 10)` feature partition is processed by the protected
-  branch, while the full smashed tensor is processed by the original branch.
-- `partition_full_smashed_attack.py`: Full-smashed reconstruction attack against
-  the P&B victim model.
-- `partition_blocked_smashed_attack.py`: Blocked-smashed reconstruction attack
-  against the P&B victim model. The attack loss only matches the noncentral
-  smashed features.
-- `unsplit_attack_on_full_smashed_layer.py`: Full-smashed attack runner for
-  standard MobileNet V1 and CifarNet victims. Supports known-client and
-  unknown-client attack modes.
-- `mobilenetv1_full_smashed_attack.py`: MobileNetV1 full-smashed attack runner
-  used for baseline comparisons against the corrected P&B stem split.
-- `models.py`: CifarNet implementation used by the UnSplit-style attack runner.
-- `train.py`, `train_baseline.py`, `evaluate.py`, `compare_models.py`: Training,
-  evaluation, and model comparison utilities.
-- `util.py`: Shared regularization, normalization, and CIFAR-10 sample helpers.
+- `mobilenet_v1.py`: P&B MobileNetV1 model definition. The default split is the
+  MobileNetV1 stem, which produces smashed features with shape `(32, 32, 32)`.
+  The model also supports configurable split points after MobileNetV1 depthwise
+  blocks and configurable centered block size.
+- `train.py`: trains a P&B MobileNetV1 victim model. Supports split and block
+  configuration through CLI flags.
+- `train_baseline.py`: trains the baseline MobileNetV1 model.
+- `mobilenetv1_full_smashed_attack.py`: baseline MobileNetV1 full-smashed
+  UnSplit-style attack runner. Supports known-client and unknown-client modes.
+- `partition_blocked_smashed_attack.py`: P&B blocked-smashed attack runner. The
+  attacker only matches observable, nonprotected smashed features.
+- `partition_full_smashed_attack.py`: legacy full-smashed attack against the
+  P&B victim model.
+- `unsplit_attack_on_full_smashed_layer.py`: general full-smashed attack runner
+  for MobileNetV1 and CifarNet victims.
+- `cifarnet_full_smashed_attack.py`: CifarNet full-smashed split-depth attack
+  runner.
+- `cifarnet_partition_blocked_smashed_attack.py`: CifarNet P&B blocked-smashed
+  split-depth attack runner.
+- `models.py`: CifarNet implementation used by CifarNet attack scripts.
+- `evaluate.py`, `compare_models.py`: model evaluation and comparison helpers.
+- `util.py`: shared regularization, normalization, and CIFAR-10 sample helpers.
 
 Generated outputs such as checkpoints, CIFAR-10 data, SLURM logs, and result
 images are intentionally ignored by Git.
@@ -36,24 +45,84 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-The scripts download CIFAR-10 automatically when needed. By default, data is
-stored under `data/cifar` or `data` depending on the script.
+The scripts download CIFAR-10 automatically when needed. Most scripts default
+to `data/cifar`; `train.py` defaults to `./data`.
 
-## Training and Evaluation
+## MobileNetV1 Split and Block Options
 
-Train the P&B model:
+The current MobileNetV1 scripts support these split options:
 
-```bash
-python train.py
+- `--split-preset stem`: split before the first depthwise block. This is the
+  default and uses the MobileNetV1 stem output.
+- `--split-preset dw1` ... `--split-preset dw12`: split after the selected
+  depthwise block.
+- `--split-after-depthwise N`: explicit equivalent of `dwN`.
+- `--split-children N`: low-level override for the number of MobileNetV1
+  feature children in the client.
+
+For P&B MobileNetV1, `--mask-side M` sets the side length of the centered
+protected block. If omitted, the model uses the split-dependent default
+`height // 3`.
+
+Default stem/block-size-10 behavior:
+
+```text
+client output:       (B, 32, 32, 32)
+protected block:     rows 11:21, columns 11:21, all 32 channels
+observed ratio:      0.9023
+protected ratio:     0.0977
 ```
 
-Train the baseline MobileNet V1 model:
+For new split points or new `--mask-side` values, retrain the P&B victim model
+and use the matching checkpoint for attacks.
+
+## Training
+
+Train the default stem-split P&B MobileNetV1 model:
+
+```bash
+python train.py \
+  --epochs 35 \
+  --checkpoint-dir checkpoints \
+  --checkpoint-name best_model.pth
+```
+
+Train a P&B MobileNetV1 model with a larger protected block:
+
+```bash
+python train.py \
+  --mask-side 16 \
+  --epochs 35 \
+  --checkpoint-dir checkpoints \
+  --checkpoint-name best_model_mask16.pth
+```
+
+Train a P&B MobileNetV1 model split after the first depthwise block:
+
+```bash
+python train.py \
+  --split-after-depthwise 1 \
+  --epochs 35 \
+  --checkpoint-dir checkpoints \
+  --checkpoint-name best_model_dw1.pth
+```
+
+Train the baseline MobileNetV1 model:
 
 ```bash
 python train_baseline.py
 ```
 
-Evaluate the trained P&B model:
+Expected default checkpoint locations:
+
+```text
+checkpoints/best_model.pth
+checkpoints/baseline_mobilenetv1.pth
+```
+
+## Evaluation
+
+Evaluate the trained default P&B model:
 
 ```bash
 python evaluate.py
@@ -65,107 +134,165 @@ Compare the trained P&B and baseline models:
 python compare_models.py
 ```
 
-Expected checkpoint locations:
+## MobileNetV1 Reconstruction Attacks
 
-```text
-checkpoints/best_model.pth
-checkpoints/baseline_mobilenetv1.pth
-```
+### Baseline MobileNetV1 Full-Smashed Attack
 
-## Reconstruction Attacks
-
-### P&B Full-Smashed Attack
-
-Known-client:
-
-```bash
-python partition_full_smashed_attack.py \
-  --checkpoint checkpoints/partition_model_attack_victim.pth \
-  --known-client \
-  --main-iters 1000 \
-  --input-iters 100 \
-  --model-iters 100 \
-  --save-dir results_partition_full_known
-```
-
-Unknown-client:
-
-```bash
-python partition_full_smashed_attack.py \
-  --checkpoint checkpoints/partition_model_attack_victim.pth \
-  --main-iters 1000 \
-  --input-iters 100 \
-  --model-iters 100 \
-  --save-dir results_partition_full_unknown
-```
-
-### P&B Blocked-Smashed Attack
-
-Known-client:
-
-```bash
-python partition_blocked_smashed_attack.py \
-  --checkpoint checkpoints/partition_model_attack_victim.pth \
-  --known-client \
-  --main-iters 1000 \
-  --input-iters 100 \
-  --model-iters 100 \
-  --save-dir results_partition_blocked_known
-```
-
-Unknown-client:
-
-```bash
-python partition_blocked_smashed_attack.py \
-  --checkpoint checkpoints/partition_model_attack_victim.pth \
-  --main-iters 1000 \
-  --input-iters 100 \
-  --model-iters 100 \
-  --save-dir results_partition_blocked_unknown
-```
-
-The corrected blocked attack masks smashed feature rows `11:21` and columns
-`11:21` across all 32 channels. Pixel MSE is still computed over the full
-recovered image. Use `--input-change-tol`, `--main-convergence-patience`, and
-`--min-main-iters` to stop on reconstructed-input convergence, or
-`--disable-input-convergence` to force the attack to run until `--main-iters`.
-The attack objective defaults to feature MSE plus Total Variation
-regularization (`--lambda-tv 0.1`, `--lambda-l2 0`). Keep `--lambda-l2` at zero
-for experiments comparable to the paper's UnSplit objective.
-
-### MobileNet V1 / CifarNet Full-Smashed Attack
-
-Comparable MobileNet V1 known-client stem attack:
+Known-client stem split:
 
 ```bash
 python mobilenetv1_full_smashed_attack.py \
   --checkpoint checkpoints/baseline_mobilenetv1.pth \
-  --split-children 3 \
+  --split-preset stem \
   --known-client \
-  --main-iters 100000 \
+  --main-iters 10000 \
+  --input-iters 100 \
+  --model-iters 100 \
   --input-change-tol 1e-4 \
   --save-dir results_mobilenetv1_full_known
 ```
 
-Comparable MobileNet V1 unknown-client stem attack:
+Unknown-client stem split:
 
 ```bash
 python mobilenetv1_full_smashed_attack.py \
   --checkpoint checkpoints/baseline_mobilenetv1.pth \
-  --split-children 3 \
-  --main-iters 100000 \
+  --split-preset stem \
+  --main-iters 10000 \
+  --input-iters 100 \
+  --model-iters 100 \
   --input-change-tol 1e-4 \
   --save-dir results_mobilenetv1_full_unknown
 ```
 
-The MobileNet V1 full-smashed attack uses the same corrected default objective:
-feature MSE plus TV regularization, with `--lambda-l2 0`.
+To attack a later split, add for example:
 
-MobileNet V1 unknown-client attack:
+```bash
+--split-after-depthwise 1
+```
+
+### P&B Blocked-Smashed Attack
+
+Known-client default stem/block-size-10 setting:
+
+```bash
+python partition_blocked_smashed_attack.py \
+  --checkpoint checkpoints/best_model.pth \
+  --split-preset stem \
+  --known-client \
+  --main-iters 10000 \
+  --input-iters 100 \
+  --model-iters 100 \
+  --input-change-tol 1e-4 \
+  --main-convergence-patience 5 \
+  --min-main-iters 50 \
+  --lambda-tv 0.1 \
+  --lambda-l2 0 \
+  --save-dir results_partition_blocked_known
+```
+
+Unknown-client default stem/block-size-10 setting:
+
+```bash
+python partition_blocked_smashed_attack.py \
+  --checkpoint checkpoints/best_model.pth \
+  --split-preset stem \
+  --main-iters 10000 \
+  --input-iters 100 \
+  --model-iters 100 \
+  --input-change-tol 1e-4 \
+  --main-convergence-patience 5 \
+  --min-main-iters 50 \
+  --lambda-tv 0.1 \
+  --lambda-l2 0 \
+  --save-dir results_partition_blocked_unknown
+```
+
+For a model trained with `--mask-side 16`, attack with the same value:
+
+```bash
+python partition_blocked_smashed_attack.py \
+  --checkpoint checkpoints/best_model_mask16.pth \
+  --mask-side 16 \
+  --known-client \
+  --main-iters 10000 \
+  --input-change-tol 1e-4 \
+  --save-dir results_partition_blocked_mask16_known
+```
+
+The blocked-smashed attack reports the full smashed shape, protected block
+bounds, masked feature ratio, observed feature ratio, average pixel MSE, and
+restored-input clone accuracy. Use `--disable-input-convergence` to force the
+attack to run until `--main-iters`.
+
+## CifarNet Reconstruction Attacks
+
+CifarNet scripts support split depths `1` through `6`, following the UnSplit
+CifarNet split-depth convention.
+
+Full-smashed unknown-client attack:
+
+```bash
+python cifarnet_full_smashed_attack.py \
+  --split-layer 1 \
+  --main-iters 10000 \
+  --input-iters 100 \
+  --model-iters 100 \
+  --input-change-tol 1e-4 \
+  --save-dir results_cifarnet_full_unknown_split1
+```
+
+Full-smashed known-client attack:
+
+```bash
+python cifarnet_full_smashed_attack.py \
+  --split-layer 1 \
+  --known-client \
+  --main-iters 10000 \
+  --input-iters 100 \
+  --model-iters 100 \
+  --input-change-tol 1e-4 \
+  --save-dir results_cifarnet_full_known_split1
+```
+
+P&B blocked-smashed unknown-client attack:
+
+```bash
+python cifarnet_partition_blocked_smashed_attack.py \
+  --split-layer 1 \
+  --main-iters 10000 \
+  --input-iters 100 \
+  --model-iters 100 \
+  --input-change-tol 1e-4 \
+  --save-dir results_cifarnet_pb_unknown_split1
+```
+
+P&B blocked-smashed known-client attack:
+
+```bash
+python cifarnet_partition_blocked_smashed_attack.py \
+  --split-layer 1 \
+  --known-client \
+  --main-iters 10000 \
+  --input-iters 100 \
+  --model-iters 100 \
+  --input-change-tol 1e-4 \
+  --save-dir results_cifarnet_pb_known_split1
+```
+
+For CifarNet P&B, `--mask-side` optionally overrides the centered protected
+block size. If omitted, the script blocks the centered spatial block for the
+current smashed tensor.
+
+## General UnSplit Runner
+
+`unsplit_attack_on_full_smashed_layer.py` remains available as a general runner
+for MobileNetV1 and CifarNet:
 
 ```bash
 python unsplit_attack_on_full_smashed_layer.py \
   --victim-model mobilenetv1 \
+  --split-children 3 \
   --main-iters 1000 \
   --input-iters 100 \
   --model-iters 100 \
@@ -174,7 +301,7 @@ python unsplit_attack_on_full_smashed_layer.py \
   --reset-attack-state
 ```
 
-CifarNet unknown-client attack:
+For CifarNet:
 
 ```bash
 python unsplit_attack_on_full_smashed_layer.py \
@@ -188,11 +315,35 @@ python unsplit_attack_on_full_smashed_layer.py \
   --reset-attack-state
 ```
 
-Add `--known-client` to either command to run the stronger known-client attack.
+Add `--known-client` to run the stronger known-client attack.
+
+## Attack Objective and Convergence
+
+The current attack objective defaults to feature MSE plus Total Variation:
+
+```text
+--lambda-tv 0.1
+--lambda-l2 0.0
+```
+
+Unknown-client attacks optimize both the recovered inputs and a clone client.
+Known-client attacks copy the victim client and optimize only the recovered
+inputs.
+
+Attack loops can stop when reconstructed input change converges:
+
+```text
+--input-change-tol 1e-7
+--main-convergence-patience 5
+--min-main-iters 50
+```
+
+Use `--disable-input-convergence` to ignore convergence and run until
+`--main-iters`.
 
 ## Outputs
 
-Attack scripts save:
+Attack scripts save image artifacts such as:
 
 ```text
 target_0.png ... target_9.png
@@ -200,12 +351,14 @@ recovered_0.png ... recovered_9.png
 ```
 
 Some scripts also save `attack_state.pt` so unknown-client attacks can be
-resumed. Use `--reset-attack-state` to force a fresh attack run.
+resumed. Use `--reset-attack-state` to force a fresh attack run when supported.
 
 ## Notes
 
+- Use `--require-cuda` on HPC runs when CPU fallback would be too slow.
 - Unknown-client attacks are stochastic because the clone client is randomly
-  initialized unless a seed is explicitly added.
-- Clone accuracy is reported as the victim model's classification accuracy on
-  the restored inputs.
+  initialized unless a seed is fixed.
+- Restore-input accuracy is reported as the victim model's classification
+  accuracy on the recovered inputs.
+- New P&B split points and new block sizes require matching checkpoints.
 - Result directories, checkpoints, data, and logs are excluded by `.gitignore`.

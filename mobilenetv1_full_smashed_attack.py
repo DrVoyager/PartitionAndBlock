@@ -1,8 +1,9 @@
 """
 Full-smashed-representation inversion attack for baseline MobileNetV1.
 
-Use --split-children 3 to attack the MobileNetV1 stem output [B, 32, 32, 32],
-which is comparable to the corrected P&B client output.
+By default this uses the original split before the first MobileNetV1 depthwise
+separable block, i.e. the stem output [B, 32, 32, 32]. Use
+--split-after-depthwise N to attack after the Nth depthwise block.
 """
 
 import argparse
@@ -24,11 +25,20 @@ DEFAULT_CHECKPOINT_NAME = "mobilenetv1_attack_victim.pth"
 MIN_ATTACK_MODEL_ACCURACY = 50.0
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR10_STD = (0.2023, 0.1994, 0.2010)
-SPLIT_PRESETS = {
-    "stem": 3,
-    "early64": 4,
-    "pb-spatial": 5,
-}
+STEM_CHILDREN = 3
+DEPTHWISE_BLOCKS = 12
+SPLIT_PRESETS = {"stem": STEM_CHILDREN}
+SPLIT_PRESETS.update({f"dw{idx}": STEM_CHILDREN + idx for idx in range(1, DEPTHWISE_BLOCKS + 1)})
+SPLIT_PRESETS.update({
+    "early64": SPLIT_PRESETS["dw1"],
+    "pb-spatial": SPLIT_PRESETS["dw2"],
+})
+
+
+def split_children_from_depthwise_blocks(block_count: int) -> int:
+    if not 1 <= block_count <= DEPTHWISE_BLOCKS:
+        raise ValueError(f"split-after-depthwise must be between 1 and {DEPTHWISE_BLOCKS}.")
+    return STEM_CHILDREN + block_count
 
 
 def cifar10_normalize_tensor(images: torch.Tensor) -> torch.Tensor:
@@ -291,8 +301,12 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-classes", type=int, default=10)
-    parser.add_argument("--split-preset", choices=tuple(SPLIT_PRESETS), default="stem")
-    parser.add_argument("--split-children", type=int, default=None)
+    parser.add_argument("--split-preset", choices=tuple(SPLIT_PRESETS), default="stem",
+                        help="Named MobileNetV1 split point. stem means before the first depthwise block; dwN means after the Nth depthwise block.")
+    parser.add_argument("--split-after-depthwise", type=int, default=None,
+                        help=f"Split after the Nth MobileNetV1 depthwise block, from 1 to {DEPTHWISE_BLOCKS}.")
+    parser.add_argument("--split-children", type=int, default=None,
+                        help="Low-level override: number of MobileNetV1 feature children in the client.")
     parser.add_argument("--main-iters", type=int, default=1000)
     parser.add_argument("--input-iters", type=int, default=100)
     parser.add_argument("--model-iters", type=int, default=100)
@@ -309,7 +323,9 @@ def main() -> None:
     parser.add_argument("--require-cuda", action="store_true")
     args = parser.parse_args()
 
-    if args.split_children is None:
+    if args.split_after_depthwise is not None:
+        args.split_children = split_children_from_depthwise_blocks(args.split_after_depthwise)
+    elif args.split_children is None:
         args.split_children = SPLIT_PRESETS[args.split_preset]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
@@ -361,6 +377,8 @@ def main() -> None:
 
     print("Victim model: MobileNet V1")
     print(f"Split preset: {args.split_preset}")
+    if args.split_after_depthwise is not None:
+        print(f"Split after depthwise block: {args.split_after_depthwise}")
     print(f"Client split children: {args.split_children}")
     print(f"Target full smashed representation shape: {tuple(target_s.shape)}")
     print(f"Attack regularization: lambda_tv={args.lambda_tv:g}, lambda_l2={args.lambda_l2:g}")

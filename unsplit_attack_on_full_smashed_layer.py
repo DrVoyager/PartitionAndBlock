@@ -15,7 +15,7 @@ MobileNet V1 or the original unsplit CifarNet.
 import argparse
 import copy
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -29,10 +29,19 @@ from util import TV, l2loss, normalize, get_examples_by_class
 
 DEFAULT_CHECKPOINT_DIR = Path("checkpoints")
 DEFAULT_ATTACK_STATE_NAME = "attack_state.pt"
+MIN_ATTACK_MODEL_ACCURACY = 50.0
+CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
+CIFAR10_STD = (0.2023, 0.1994, 0.2010)
 MODEL_CHECKPOINT_NAMES = {
     "mobilenetv1": "mobilenetv1_attack_victim.pth",
     "cifarnet": "cifarnet_attack_victim.pth",
 }
+
+
+def cifar10_normalize_tensor(images: torch.Tensor) -> torch.Tensor:
+    mean = images.new_tensor(CIFAR10_MEAN).view(1, 3, 1, 1)
+    std = images.new_tensor(CIFAR10_STD).view(1, 3, 1, 1)
+    return (images - mean) / std
 
 
 class MobileNetV1(nn.Module):
@@ -89,8 +98,10 @@ class MobileNetV1(nn.Module):
 class MobileNetV1ClientModel(nn.Module):
     """Client-side MobileNet V1 prefix used to produce the smashed representation."""
 
-    def __init__(self, mobilenet: MobileNetV1, split_children: int = 4):
+    def __init__(self, mobilenet: MobileNetV1, split_children: int = 3):
         super().__init__()
+        if not 1 <= split_children <= len(mobilenet.features):
+            raise ValueError(f"split_children must be between 1 and {len(mobilenet.features)}.")
         self.features = nn.Sequential(*list(mobilenet.features.children())[:split_children])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -132,9 +143,13 @@ def restored_input_accuracy(
     restored_images: torch.Tensor,
     true_labels: torch.Tensor,
     device: torch.device,
+    input_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Tuple[float, int, int]:
     victim_model.eval()
-    logits = victim_model(restored_images.to(device))
+    model_input = restored_images.to(device)
+    if input_transform is not None:
+        model_input = input_transform(model_input)
+    logits = victim_model(model_input)
     predicted = logits.argmax(dim=1)
     labels = true_labels.to(device)
     correct = (predicted == labels).sum().item()
@@ -272,10 +287,15 @@ def full_smashed_inversion_attack(
     target_s: torch.Tensor,
     input_size: Tuple[int, ...],
     lambda_tv: float = 0.1,
-    lambda_l2: float = 1.0,
+    lambda_l2: float = 0.0,
     main_iters: int = 1000,
     input_iters: int = 100,
     model_iters: int = 100,
+    input_change_tol: float = 1e-7,
+    main_convergence_patience: int = 5,
+    min_main_iters: int = 50,
+    disable_input_convergence: bool = False,
+    input_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     lr_input: float = 1e-3,
     lr_model: float = 1e-3,
     steal_model: bool = True,
@@ -292,6 +312,15 @@ def full_smashed_inversion_attack(
     If steal_model=True, alternates between optimizing x_hat and clone_client.
     If steal_model=False, clone_client is known and only x_hat is optimized.
     """
+    if input_iters < 1:
+        raise ValueError("input_iters must be at least 1.")
+    if model_iters < 1:
+        raise ValueError("model_iters must be at least 1.")
+    if main_convergence_patience < 1:
+        raise ValueError("main_convergence_patience must be at least 1.")
+    if min_main_iters < 1:
+        raise ValueError("min_main_iters must be at least 1.")
+
     device = target_s.device
     clone_client = clone_client.to(device)
 
@@ -345,6 +374,8 @@ def full_smashed_inversion_attack(
 
     mse = nn.MSELoss()
     target_s = target_s.detach()
+    previous_x_hat = x_hat.detach().clone()
+    stable_main_steps = 0
 
     def save_attack_state(total_iters: int) -> None:
         if state_path is None:
@@ -380,7 +411,8 @@ def full_smashed_inversion_attack(
         clone_client.eval()
         for _ in range(input_iters):
             input_opt.zero_grad(set_to_none=True)
-            pred_s = clone_client(x_hat)
+            model_input = input_transform(x_hat) if input_transform is not None else x_hat
+            pred_s = clone_client(model_input)
             loss = mse(pred_s, target_s) + lambda_tv * TV(x_hat) + lambda_l2 * l2loss(x_hat)
             loss.backward()
             input_opt.step()
@@ -394,23 +426,52 @@ def full_smashed_inversion_attack(
             for _ in range(model_iters):
                 assert model_opt is not None
                 model_opt.zero_grad(set_to_none=True)
-                pred_s = clone_client(x_hat.detach())
+                detached_x = x_hat.detach()
+                model_input = input_transform(detached_x) if input_transform is not None else detached_x
+                pred_s = clone_client(model_input)
                 model_loss = mse(pred_s, target_s)
                 model_loss.backward()
                 model_opt.step()
 
+        clone_client.eval()
+        with torch.no_grad():
+            model_input = input_transform(x_hat) if input_transform is not None else x_hat
+            match_loss = mse(clone_client(model_input), target_s).item()
+            input_change = (x_hat.detach() - previous_x_hat).abs().mean().item()
+
+        if input_change <= input_change_tol:
+            stable_main_steps += 1
+        else:
+            stable_main_steps = 0
+        previous_x_hat = x_hat.detach().clone()
+
         should_log = log_every and (total_iter % log_every == 0 or local_iter == 0)
         if should_log:
-            clone_client.eval()
-            with torch.no_grad():
-                match_loss = mse(clone_client(x_hat), target_s).item()
             print(
                 f"iter {total_iter:04d}/{total_target_iters} "
-                f"(run +{local_iter + 1}/{main_iters}) | smashed_mse={match_loss:.6f}"
+                f"(run +{local_iter + 1}/{main_iters}) | "
+                f"smashed_mse={match_loss:.6f} | "
+                f"mean_abs_input_change={input_change:.8f} | "
+                f"stable_main_steps={stable_main_steps}/{main_convergence_patience}"
             )
 
         if state_save_every and (total_iter % state_save_every == 0):
             save_attack_state(total_iter)
+
+        if (
+            not disable_input_convergence
+            and local_iter + 1 >= min_main_iters
+            and stable_main_steps >= main_convergence_patience
+        ):
+            print(
+                f"Converged at iter {total_iter:04d}/{total_target_iters}: "
+                f"smashed_mse={match_loss:.6f}, "
+                f"mean_abs_input_change={input_change:.8f}, "
+                f"stable_main_steps={stable_main_steps}/{main_convergence_patience}, "
+                f"input_change_tol={input_change_tol:.2e}"
+            )
+            save_attack_state(total_iter)
+            return x_hat.detach(), total_iter
 
     save_attack_state(total_target_iters)
     return x_hat.detach(), total_target_iters
@@ -424,7 +485,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-classes", type=int, default=10)
-    parser.add_argument("--split-children", type=int, default=4,
+    parser.add_argument("--split-children", type=int, default=3,
                         help="Number of MobileNetV1 feature children used as the client model.")
     parser.add_argument("--split-layer", type=int, default=1,
                         help="CifarNet split layer index using the original unsplit numbering (0-17).")
@@ -432,7 +493,16 @@ def main() -> None:
     parser.add_argument("--input-iters", type=int, default=100)
     parser.add_argument("--model-iters", type=int, default=100)
     parser.add_argument("--lambda-tv", type=float, default=0.1)
-    parser.add_argument("--lambda-l2", type=float, default=1.0)
+    parser.add_argument("--lambda-l2", type=float, default=0.0)
+    parser.add_argument("--input-change-tol", "--input-loss-tol", dest="input_change_tol", type=float, default=1e-7,
+                        help="Stop early when mean absolute reconstructed-input change stays below this tolerance.")
+    parser.add_argument("--main-convergence-patience", "--convergence-patience",
+                        dest="main_convergence_patience", type=int, default=5,
+                        help="Number of consecutive stable main iterations required for convergence.")
+    parser.add_argument("--min-main-iters", type=int, default=50,
+                        help="Minimum additional main iterations before convergence can stop the attack.")
+    parser.add_argument("--disable-input-convergence", action="store_true",
+                        help="Ignore reconstructed-input convergence and run until main-iters is reached.")
     parser.add_argument("--known-client", action="store_true",
                         help="Use a copy of the victim client instead of stealing a random clone.")
     parser.add_argument("--save-dir", type=str, default="",
@@ -446,6 +516,8 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=str, default="", help="Optional checkpoint for a trained victim model.")
     parser.add_argument("--checkpoint-dir", type=str, default=str(DEFAULT_CHECKPOINT_DIR),
                         help="Directory to search for or save trained victim weights.")
+    parser.add_argument("--require-cuda", action="store_true",
+                        help="Stop before running if CUDA is not available.")
     args = parser.parse_args()
     if not args.save_dir:
         args.save_dir = f"results_{args.victim_model}_attack"
@@ -457,11 +529,22 @@ def main() -> None:
         else "mps" if torch.backends.mps.is_available()
         else "cpu"
     )
+    if args.require_cuda and device.type != "cuda":
+        raise SystemExit("ERROR: CUDA is required for this run, but torch.cuda.is_available() is false.")
     print(f"Using device: {device}")
 
     transform = transforms.ToTensor()
+    normalized_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+    ])
+    model_transform = normalized_transform if args.victim_model == "mobilenetv1" else transform
+    input_transform = cifar10_normalize_tensor if args.victim_model == "mobilenetv1" else None
+
     trainset = datasets.CIFAR10(args.data_root, download=True, train=True, transform=transform)
     testset = datasets.CIFAR10(args.data_root, download=True, train=False, transform=transform)
+    model_trainset = datasets.CIFAR10(args.data_root, download=True, train=True, transform=model_transform)
+    model_testset = datasets.CIFAR10(args.data_root, download=True, train=False, transform=model_transform)
 
     model_name = format_model_name(args.victim_model)
     checkpoint_name = MODEL_CHECKPOINT_NAMES[args.victim_model]
@@ -479,8 +562,8 @@ def main() -> None:
             print(f"No {model_name} weights found in {checkpoint_dir}; training victim model...")
             test_acc = train_classifier_model(
                 victim,
-                trainset,
-                testset,
+                model_trainset,
+                model_testset,
                 device,
                 epochs=args.epochs,
                 batch_size=args.batch_size,
@@ -488,6 +571,14 @@ def main() -> None:
             save_model_checkpoint(victim, checkpoint_dir / checkpoint_name, args.epochs, test_acc)
 
     victim.eval()
+    victim_acc = accuracy(victim, model_testset, device, batch_size=args.batch_size)
+    print(f"Victim model test accuracy before attack: {victim_acc:.2f}%")
+    if victim_acc < MIN_ATTACK_MODEL_ACCURACY:
+        raise SystemExit(
+            "ERROR: Victim model accuracy is below the attack sanity threshold: "
+            f"{victim_acc:.2f}% < {MIN_ATTACK_MODEL_ACCURACY:.2f}%. "
+            "Stopping before attack."
+        )
 
     images = torch.stack(
         [get_examples_by_class(testset, c, count=1) for c in range(args.num_classes)],
@@ -504,7 +595,8 @@ def main() -> None:
     victim_client.eval()
 
     with torch.no_grad():
-        target_s = victim_client(images)
+        model_input = input_transform(images) if input_transform is not None else images
+        target_s = victim_client(model_input)
 
     print(f"Victim model: {model_name}")
     if args.victim_model == "mobilenetv1":
@@ -512,6 +604,7 @@ def main() -> None:
     else:
         print(f"Client split layer: {args.split_layer}")
     print(f"Target full smashed representation shape: {tuple(target_s.shape)}")
+    print(f"Attack regularization: lambda_tv={args.lambda_tv:g}, lambda_l2={args.lambda_l2:g}")
 
     if args.known_client:
         clone_client = copy.deepcopy(victim_client).to(device)
@@ -537,6 +630,11 @@ def main() -> None:
         main_iters=args.main_iters,
         input_iters=args.input_iters,
         model_iters=args.model_iters,
+        input_change_tol=args.input_change_tol,
+        main_convergence_patience=args.main_convergence_patience,
+        min_main_iters=args.min_main_iters,
+        disable_input_convergence=args.disable_input_convergence,
+        input_transform=input_transform,
         steal_model=steal_model,
         state_path=attack_state_path,
         reset_attack_state=args.reset_attack_state,
@@ -551,6 +649,10 @@ def main() -> None:
             "lambda_l2": args.lambda_l2,
             "input_iters": args.input_iters,
             "model_iters": args.model_iters,
+            "input_change_tol": args.input_change_tol,
+            "main_convergence_patience": args.main_convergence_patience,
+            "min_main_iters": args.min_main_iters,
+            "input_transform": "cifar10_normalize" if input_transform is not None else None,
         },
     )
 
@@ -570,9 +672,15 @@ def main() -> None:
 
     print(f"Average pixel MSE: {sum(losses) / len(losses):.6f}")
     print(f"Total cumulative attack iterations: {total_attack_iters}")
-    restored_acc, restored_correct, restored_total = restored_input_accuracy(victim, result, true_labels, device)
+    restored_acc, restored_correct, restored_total = restored_input_accuracy(
+        victim,
+        result,
+        true_labels,
+        device,
+        input_transform=input_transform,
+    )
     print(
-        "Clone accuracy (victim model on restored inputs): "
+        "Restored-input clone accuracy (victim model on restored inputs): "
         f"{restored_acc:.2f}% ({restored_correct}/{restored_total})"
     )
     print(f"Saved recovered and target images to: {save_dir}")

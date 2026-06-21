@@ -1,3 +1,4 @@
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -5,7 +6,12 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import time
 import os
-from mobilenet_v1 import PartitionAndBlockingModel
+from mobilenet_v1 import (
+    DEPTHWISE_BLOCKS,
+    SPLIT_PRESETS,
+    PartitionAndBlockingModel,
+    split_children_from_depthwise_blocks,
+)
 
 
 def train_epoch(model, train_loader, criterion, optimizer, device):
@@ -61,12 +67,39 @@ def validate(model, val_loader, criterion, device):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", type=str, default="./data")
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=35)
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--checkpoint-name", type=str, default="best_model.pth")
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint-dir/checkpoint-name if it exists.")
+    parser.add_argument("--split-preset", choices=tuple(SPLIT_PRESETS), default="stem",
+                        help="Named MobileNetV1 split point. stem means before the first depthwise block; dwN means after the Nth depthwise block.")
+    parser.add_argument("--split-after-depthwise", type=int, default=None,
+                        help=f"Split after the Nth MobileNetV1 depthwise block, from 1 to {DEPTHWISE_BLOCKS}.")
+    parser.add_argument("--split-children", type=int, default=None,
+                        help="Low-level override: number of spatial MobileNetV1 feature children in the P&B client.")
+    parser.add_argument("--mask-side", type=int, default=None,
+                        help="Override the centered protected spatial mask side length. Omit to use the default split-dependent size.")
+    parser.add_argument("--require-cuda", action="store_true", help="Stop before running if CUDA is not available.")
+    args = parser.parse_args()
+
+    if args.split_after_depthwise is not None:
+        args.split_children = split_children_from_depthwise_blocks(args.split_after_depthwise)
+    elif args.split_children is None:
+        args.split_children = SPLIT_PRESETS[args.split_preset]
+
     if torch.cuda.is_available():
         device = torch.device('cuda')
     elif torch.backends.mps.is_available():
         device = torch.device('mps')
     else:
         device = torch.device('cpu')
+    if args.require_cuda and device.type != 'cuda':
+        raise SystemExit('ERROR: CUDA is required for this run, but torch.cuda.is_available() is false.')
     print(f'Using device: {device}')
     
     transform_train = transforms.Compose([
@@ -82,14 +115,23 @@ def main():
     ])
     
     print('Loading CIFAR-10 dataset...')
-    train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
-    test_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+    train_dataset = datasets.CIFAR10(root=args.data_root, train=True, download=True, transform=transform_train)
+    test_dataset = datasets.CIFAR10(root=args.data_root, train=False, download=True, transform=transform_test)
     
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=2)
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
     
     print('\nInitializing Partition and Blocking model...')
-    model = PartitionAndBlockingModel(num_classes=10).to(device)
+    print(f'Split preset: {args.split_preset}')
+    if args.split_after_depthwise is not None:
+        print(f'Split after depthwise block: {args.split_after_depthwise}')
+    print(f'Client split children: {args.split_children}')
+    print(f'Mask side: {args.mask_side if args.mask_side is not None else "default"}')
+    model = PartitionAndBlockingModel(
+        num_classes=10,
+        split_children=args.split_children,
+        mask_side=args.mask_side,
+    ).to(device)
     
     with torch.no_grad():
         model.eval()
@@ -99,14 +141,15 @@ def main():
     print(f'Model initialized. Output shape: {dummy_output.shape}')
     
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
     
-    num_epochs = 35
+    num_epochs = args.epochs
     best_acc = 0.0
+    checkpoint_path = os.path.join(args.checkpoint_dir, args.checkpoint_name)
     
-    if os.path.exists('checkpoints/best_model.pth'):
-        checkpoint = torch.load('checkpoints/best_model.pth', map_location=device)
+    if args.resume and os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         best_acc = checkpoint['best_acc']
@@ -115,7 +158,7 @@ def main():
     else:
         start_epoch = 0
     
-    os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
     
     if not 'start_epoch' in dir():
         start_epoch = 0
@@ -144,7 +187,11 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_acc': best_acc,
-            }, 'checkpoints/best_model.pth')
+                'split_children': args.split_children,
+                'split_preset': args.split_preset,
+                'split_after_depthwise': args.split_after_depthwise,
+                'mask_side': args.mask_side,
+            }, checkpoint_path)
             print(f'  Best model saved with accuracy: {best_acc:.2f}%')
     
     print(f'\nTraining completed!')

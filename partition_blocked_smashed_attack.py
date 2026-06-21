@@ -6,8 +6,9 @@ The attacker observes only the noncentral smashed representation:
     target_blocked_s = mask * victim.client_model(x)
 
 and recovers x_hat by matching only the unmasked smashed features. With the
-corrected P&B model, victim.client_model(x) has shape [B, 32, 32, 32] and the
-protected central partition is h=11:21, w=11:21.
+default stem split, victim.client_model(x) has shape [B, 32, 32, 32] and the
+protected central partition is h=11:21, w=11:21. Use --split-after-depthwise N
+to move the split after the Nth MobileNetV1 depthwise block.
 """
 
 import argparse
@@ -21,7 +22,13 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
 
-from mobilenet_v1 import MobileNetV1ClientModel, PartitionAndBlockingModel
+from mobilenet_v1 import (
+    DEPTHWISE_BLOCKS,
+    SPLIT_PRESETS,
+    MobileNetV1ClientModel,
+    PartitionAndBlockingModel,
+    split_children_from_depthwise_blocks,
+)
 from util import TV, get_examples_by_class, l2loss, normalize
 
 
@@ -104,6 +111,21 @@ def train_partition_model(
             f"Epoch {epoch + 1:02d}/{epochs} | "
             f"loss={running_loss / len(loader):.4f} | test_acc={test_acc:.2f}%"
         )
+
+
+def load_partition_checkpoint(model: nn.Module, checkpoint_path: Path, device: torch.device, split_children: int, mask_side: Optional[int]) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        raise SystemExit(
+            f"ERROR: Checkpoint {checkpoint_path} is incompatible with split_children={split_children} "
+            f"and mask_side={mask_side}. A new split or mask setting changes the P&B client, "
+            "protected branch, and original server suffix; retrain the model for this setting "
+            "or provide a matching checkpoint."
+        ) from exc
+    print(f"Loaded checkpoint: {checkpoint_path}")
 
 
 def central_partition_bounds(model: PartitionAndBlockingModel, s: torch.Tensor) -> Tuple[int, int, int, int]:
@@ -242,6 +264,14 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-classes", type=int, default=10)
+    parser.add_argument("--split-preset", choices=tuple(SPLIT_PRESETS), default="stem",
+                        help="Named MobileNetV1 split point. stem means before the first depthwise block; dwN means after the Nth depthwise block.")
+    parser.add_argument("--split-after-depthwise", type=int, default=None,
+                        help=f"Split after the Nth MobileNetV1 depthwise block, from 1 to {DEPTHWISE_BLOCKS}.")
+    parser.add_argument("--split-children", type=int, default=None,
+                        help="Low-level override: number of spatial MobileNetV1 feature children in the P&B client.")
+    parser.add_argument("--mask-side", type=int, default=None,
+                        help="Override the centered protected spatial mask side length. Omit to use the default split-dependent size.")
     parser.add_argument("--main-iters", type=int, default=1000)
     parser.add_argument("--input-iters", type=int, default=100)
     parser.add_argument("--model-iters", type=int, default=100)
@@ -262,6 +292,11 @@ def main() -> None:
     parser.add_argument("--require-cuda", action="store_true", help="Stop before running if CUDA is not available.")
     args = parser.parse_args()
 
+    if args.split_after_depthwise is not None:
+        args.split_children = split_children_from_depthwise_blocks(args.split_after_depthwise)
+    elif args.split_children is None:
+        args.split_children = SPLIT_PRESETS[args.split_preset]
+
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     if args.require_cuda and device.type != "cuda":
         raise SystemExit("ERROR: CUDA is required for this run, but torch.cuda.is_available() is false.")
@@ -276,17 +311,20 @@ def main() -> None:
     ])
     eval_testset = datasets.CIFAR10(args.data_root, download=True, train=False, transform=eval_transform)
 
-    victim = PartitionAndBlockingModel(num_classes=args.num_classes).to(device)
+    victim = PartitionAndBlockingModel(
+        num_classes=args.num_classes,
+        split_children=args.split_children,
+        mask_side=args.mask_side,
+    ).to(device)
 
     if args.checkpoint:
-        checkpoint = torch.load(args.checkpoint, map_location=device)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            victim.load_state_dict(checkpoint["model_state_dict"])
-        else:
-            victim.load_state_dict(checkpoint)
-        print(f"Loaded checkpoint: {args.checkpoint}")
+        load_partition_checkpoint(victim, Path(args.checkpoint), device, args.split_children, args.mask_side)
     else:
-        print("Training victim PartitionAndBlockingModel...")
+        print(
+            "Training victim PartitionAndBlockingModel "
+            f"for split_children={args.split_children}. "
+            "Use a matching checkpoint for this split to skip retraining."
+        )
         train_partition_model(victim, trainset, testset, device, epochs=args.epochs, batch_size=args.batch_size)
 
     victim.eval()
@@ -308,10 +346,18 @@ def main() -> None:
         observed_target_s = target_s * mask
 
     h_start, h_end, w_start, w_end = central_partition_bounds(victim, target_s)
+    print("Victim model: P&B MobileNet V1")
+    print(f"Split preset: {args.split_preset}")
+    if args.split_after_depthwise is not None:
+        print(f"Split after depthwise block: {args.split_after_depthwise}")
+    print(f"Client split children: {args.split_children}")
+    print(f"Mask side: {args.mask_side if args.mask_side is not None else 'default'}")
     print(f"Full smashed representation shape: {tuple(target_s.shape)}")
     print(f"Central protected partition removed: h={h_start}:{h_end}, w={w_start}:{w_end}")
     print(f"Observed noncentral smashed representation shape: {tuple(observed_target_s.shape)}")
-    print(f"Observed feature ratio: {mask.sum().item() / mask.numel():.4f}")
+    observed_ratio = mask.sum().item() / mask.numel()
+    print(f"Masked feature ratio: {1.0 - observed_ratio:.4f}")
+    print(f"Observed feature ratio: {observed_ratio:.4f}")
     print(f"Attack regularization: lambda_tv={args.lambda_tv:g}, lambda_l2={args.lambda_l2:g}")
 
     if args.known_client:
@@ -319,7 +365,7 @@ def main() -> None:
         steal_model = False
         print("Attack mode: known client; optimizing only x_hat.")
     else:
-        clone_client = MobileNetV1ClientModel().to(device)
+        clone_client = MobileNetV1ClientModel(split_children=args.split_children).to(device)
         steal_model = True
         print("Attack mode: random clone client; optimizing both x_hat and clone_client.")
 
