@@ -72,19 +72,39 @@ class MobileNetV1ClientModel(nn.Module):
 
 
 class ProtectedServerLayers(nn.Module):
-    def __init__(self, in_channels, h, w):
+    """Protected branch retaining configurable projected feature maps."""
+
+    def __init__(self, in_channels, pooled_size=4, projected_channels=None):
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(in_channels * h * w, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
+        self.pooled_size = pooled_size
+        self.projected_channels = pooled_size if projected_channels is None else projected_channels
+        if not isinstance(self.projected_channels, int) or not 1 <= self.projected_channels <= in_channels:
+            raise ValueError(f"projected_channels must be an integer between 1 and {in_channels}.")
+        self.spatial_filter = nn.Conv2d(
+            in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels, bias=False
         )
+        self.relu_spatial = nn.ReLU(inplace=True)
+        self.channel_projection = nn.Conv2d(in_channels, self.projected_channels, kernel_size=1, bias=True)
+        self.pool = nn.AdaptiveAvgPool2d((pooled_size, pooled_size))
+        self.fc = nn.Linear(self.projected_channels * pooled_size * pooled_size, 256)
+        self.relu_output = nn.ReLU(inplace=True)
+
+        with torch.no_grad():
+            self.spatial_filter.weight.zero_()
+            self.spatial_filter.weight[:, 0, 1, 1] = 1.0
+            self.channel_projection.weight.zero_()
+            for output_channel in range(self.projected_channels):
+                start = output_channel * in_channels // self.projected_channels
+                end = (output_channel + 1) * in_channels // self.projected_channels
+                self.channel_projection.weight[output_channel, start:end].fill_(1.0 / (end - start))
+            self.channel_projection.bias.zero_()
 
     def forward(self, x):
-        return self.fc(x)
+        features = self.relu_spatial(self.spatial_filter(x))
+        projected_maps = self.channel_projection(features)
+        pooled = self.pool(projected_maps)
+        flattened = torch.flatten(pooled, start_dim=1)
+        return self.relu_output(self.fc(flattened))
 
 
 class OriginalServerLayers(nn.Module):
@@ -128,16 +148,29 @@ class PartitionAndBlockingModel(nn.Module):
 
     By default, the split is before the first MobileNetV1 depthwise block:
     the client output is [B, 32, 32, 32], the protected branch consumes the
-    centered [B, 32, 10, 10] partition, and the original branch consumes the
-    full smashed tensor and applies the remaining MobileNetV1 layers. For
-    later splits, the client contains all MobileNetV1 blocks before the split,
-    and the original branch contains only the remaining original layers.
+    centered [B, 32, 10, 10] partition, and the original branch consumes a
+    same-shaped tensor with that protected partition zeroed. For later splits,
+    the client contains all MobileNetV1 blocks before the split, and the
+    original branch contains only the remaining original layers.
     """
 
-    def __init__(self, num_classes=10, split_children: int = STEM_CHILDREN, mask_side=None):
+    def __init__(
+        self,
+        num_classes=10,
+        split_children: int = STEM_CHILDREN,
+        mask_side=None,
+        protected_pool_size: int = 4,
+        protected_channels: int | None = None,
+        mask_fill: str = "learned",
+    ):
         super().__init__()
         self.split_children = validate_split_children(split_children)
         self.mask_side = mask_side
+        self.protected_pool_size = protected_pool_size
+        self.protected_channels = protected_pool_size if protected_channels is None else protected_channels
+        if mask_fill not in {"learned", "zero"}:
+            raise ValueError("mask_fill must be either 'learned' or 'zero'.")
+        self.mask_fill_type = mask_fill
         self.client_model = MobileNetV1ClientModel(split_children=self.split_children)
 
         with torch.no_grad():
@@ -153,11 +186,19 @@ class PartitionAndBlockingModel(nn.Module):
         else:
             self.grid_h = max(height // 3, 1)
             self.grid_w = max(width // 3, 1)
+        if not isinstance(protected_pool_size, int) or protected_pool_size < 1:
+            raise ValueError("protected_pool_size must be a positive integer.")
         self.channels = channels
 
-        self.protected_layers = ProtectedServerLayers(channels, self.grid_h, self.grid_w)
+        self.protected_layers = ProtectedServerLayers(
+            channels, pooled_size=protected_pool_size, projected_channels=self.protected_channels
+        )
         self.original_layers = OriginalServerLayers(split_children=self.split_children)
         self.merging_layers = MergingLayers(protected_dim=256, original_dim=256, num_classes=num_classes)
+        if mask_fill == "learned":
+            self.mask_fill = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        else:
+            self.register_buffer("mask_fill", torch.zeros(1, channels, 1, 1))
 
     def central_partition_bounds(self, s):
         _, _, height, width = s.shape
@@ -178,8 +219,16 @@ class PartitionAndBlockingModel(nn.Module):
 
         return central
 
+    def mask_central_partition(self, s):
+        """Return the ordinary-server view with the protected block removed."""
+        h_start, h_end, w_start, w_end = self.central_partition_bounds(s)
+        ordinary_mask = torch.ones_like(s)
+        ordinary_mask[:, :, h_start:h_end, w_start:w_end] = 0
+        fill = self.mask_fill.to(dtype=s.dtype, device=s.device)
+        return s * ordinary_mask + fill * (1 - ordinary_mask)
+
     def forward(self, x):
         s = self.client_model(x)
         z_p = self.protected_layers(self.extract_central_partition(s))
-        z_o = self.original_layers(s)
+        z_o = self.original_layers(self.mask_central_partition(s))
         return self.merging_layers(z_p, z_o)
