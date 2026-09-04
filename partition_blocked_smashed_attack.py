@@ -113,16 +113,24 @@ def train_partition_model(
         )
 
 
-def load_partition_checkpoint(model: nn.Module, checkpoint_path: Path, device: torch.device, split_children: int, mask_side: Optional[int]) -> None:
+def load_partition_checkpoint(
+    model: nn.Module,
+    checkpoint_path: Path,
+    device: torch.device,
+    split_children: int,
+    mask_side: Optional[int],
+    protected_width: float,
+    protected_pool_size: int,
+) -> None:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
     try:
         model.load_state_dict(state_dict)
     except RuntimeError as exc:
         raise SystemExit(
-            f"ERROR: Checkpoint {checkpoint_path} is incompatible with split_children={split_children} "
-            f"and mask_side={mask_side}. A new split or mask setting changes the P&B client, "
-            "protected branch, and original server suffix; retrain the model for this setting "
+            f"ERROR: Checkpoint {checkpoint_path} is incompatible with split_children={split_children}, "
+            f"mask_side={mask_side}, protected_width={protected_width}, and "
+            f"protected_pool_size={protected_pool_size}. Retrain the model for this configuration "
             "or provide a matching checkpoint."
         ) from exc
     print(f"Loaded checkpoint: {checkpoint_path}")
@@ -272,6 +280,10 @@ def main() -> None:
                         help="Low-level override: number of spatial MobileNetV1 feature children in the P&B client.")
     parser.add_argument("--mask-side", type=int, default=None,
                         help="Override the centered protected spatial mask side length. Omit to use the default split-dependent size.")
+    parser.add_argument("--protected-width", type=float, default=1.0,
+                        help="Width multiplier for the protected convolutional encoder (default: 1.0).")
+    parser.add_argument("--protected-pool-size", type=int, default=2,
+                        help="Adaptive pooling side length for the protected encoder (default: 2).")
     parser.add_argument("--main-iters", type=int, default=1000)
     parser.add_argument("--input-iters", type=int, default=100)
     parser.add_argument("--model-iters", type=int, default=100)
@@ -315,10 +327,20 @@ def main() -> None:
         num_classes=args.num_classes,
         split_children=args.split_children,
         mask_side=args.mask_side,
+        protected_width=args.protected_width,
+        protected_pool_size=args.protected_pool_size,
     ).to(device)
 
     if args.checkpoint:
-        load_partition_checkpoint(victim, Path(args.checkpoint), device, args.split_children, args.mask_side)
+        load_partition_checkpoint(
+            victim,
+            Path(args.checkpoint),
+            device,
+            args.split_children,
+            args.mask_side,
+            args.protected_width,
+            args.protected_pool_size,
+        )
     else:
         print(
             "Training victim PartitionAndBlockingModel "
@@ -352,6 +374,8 @@ def main() -> None:
         print(f"Split after depthwise block: {args.split_after_depthwise}")
     print(f"Client split children: {args.split_children}")
     print(f"Mask side: {args.mask_side if args.mask_side is not None else 'default'}")
+    print(f"Protected encoder width: {args.protected_width}")
+    print(f"Protected encoder pool size: {args.protected_pool_size}")
     print(f"Full smashed representation shape: {tuple(target_s.shape)}")
     print(f"Central protected partition removed: h={h_start}:{h_end}, w={w_start}:{w_end}")
     print(f"Observed noncentral smashed representation shape: {tuple(observed_target_s.shape)}")

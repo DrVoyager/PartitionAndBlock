@@ -39,6 +39,24 @@ def depthwise_conv(in_ch, out_ch, stride):
     )
 
 
+def scale_channels(base_channels, r, divisor=8):
+    """Scale a channel count to a positive multiple of ``divisor``."""
+    if r <= 0:
+        raise ValueError("r must be greater than zero.")
+    if not isinstance(divisor, int) or divisor < 1:
+        raise ValueError("divisor must be a positive integer.")
+
+    scaled = round(base_channels * r / divisor) * divisor
+    return max(divisor, scaled)
+
+
+def group_norm(num_channels):
+    """Use the largest supported group count that divides ``num_channels``."""
+    for groups in (8, 4, 2, 1):
+        if num_channels % groups == 0:
+            return nn.GroupNorm(groups, num_channels)
+
+
 def mobilenet_v1_spatial_features():
     return [
         nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=False),
@@ -71,40 +89,60 @@ class MobileNetV1ClientModel(nn.Module):
         return self.features(x)
 
 
-class ProtectedServerLayers(nn.Module):
-    """Protected branch retaining configurable projected feature maps."""
+class IntermediateFeatureEncoder(nn.Module):
+    """Resolution-independent encoder for a protected smashed-data block."""
 
-    def __init__(self, in_channels, pooled_size=4, projected_channels=None):
+    def __init__(
+        self,
+        input_channels=3,
+        output_dim=256,
+        r=1.0,
+        pool_size=2,
+    ):
         super().__init__()
-        self.pooled_size = pooled_size
-        self.projected_channels = pooled_size if projected_channels is None else projected_channels
-        if not isinstance(self.projected_channels, int) or not 1 <= self.projected_channels <= in_channels:
-            raise ValueError(f"projected_channels must be an integer between 1 and {in_channels}.")
-        self.spatial_filter = nn.Conv2d(
-            in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels, bias=False
-        )
-        self.relu_spatial = nn.ReLU(inplace=True)
-        self.channel_projection = nn.Conv2d(in_channels, self.projected_channels, kernel_size=1, bias=True)
-        self.pool = nn.AdaptiveAvgPool2d((pooled_size, pooled_size))
-        self.fc = nn.Linear(self.projected_channels * pooled_size * pooled_size, 256)
-        self.relu_output = nn.ReLU(inplace=True)
 
-        with torch.no_grad():
-            self.spatial_filter.weight.zero_()
-            self.spatial_filter.weight[:, 0, 1, 1] = 1.0
-            self.channel_projection.weight.zero_()
-            for output_channel in range(self.projected_channels):
-                start = output_channel * in_channels // self.projected_channels
-                end = (output_channel + 1) * in_channels // self.projected_channels
-                self.channel_projection.weight[output_channel, start:end].fill_(1.0 / (end - start))
-            self.channel_projection.bias.zero_()
+        if not isinstance(pool_size, int) or pool_size < 1:
+            raise ValueError("pool_size must be a positive integer.")
+
+        c1 = scale_channels(32, r)
+        c2 = scale_channels(64, r)
+        c3 = scale_channels(128, r)
+
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(input_channels, c1, kernel_size=3, stride=1, padding=1, bias=False),
+            group_norm(c1),
+            nn.GELU(),
+            nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1, bias=False),
+            group_norm(c2),
+            nn.GELU(),
+            nn.Conv2d(c2, c3, kernel_size=3, stride=2, padding=1, bias=False),
+            group_norm(c3),
+            nn.GELU(),
+            nn.Conv2d(c3, c3, kernel_size=3, stride=1, padding=1, bias=False),
+            group_norm(c3),
+            nn.GELU(),
+        )
+
+        self.pool = nn.AdaptiveAvgPool2d((pool_size, pool_size))
+        self.projection = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(c3 * pool_size**2, output_dim),
+        )
+
+        self.input_channels = input_channels
+        self.output_dim = output_dim
+        self.r = r
+        self.pool_size = pool_size
+        self.feature_channels = (c1, c2, c3)
 
     def forward(self, x):
-        features = self.relu_spatial(self.spatial_filter(x))
-        projected_maps = self.channel_projection(features)
-        pooled = self.pool(projected_maps)
-        flattened = torch.flatten(pooled, start_dim=1)
-        return self.relu_output(self.fc(flattened))
+        x = self.feature_extractor(x)
+        x = self.pool(x)
+        return self.projection(x)
+
+
+class ProtectedServerLayers(IntermediateFeatureEncoder):
+    """P&B protected branch implemented by the intermediate feature encoder."""
 
 
 class OriginalServerLayers(nn.Module):
@@ -159,15 +197,15 @@ class PartitionAndBlockingModel(nn.Module):
         num_classes=10,
         split_children: int = STEM_CHILDREN,
         mask_side=None,
-        protected_pool_size: int = 4,
-        protected_channels: int | None = None,
+        protected_width: float = 1.0,
+        protected_pool_size: int = 2,
         mask_fill: str = "learned",
     ):
         super().__init__()
         self.split_children = validate_split_children(split_children)
         self.mask_side = mask_side
+        self.protected_width = protected_width
         self.protected_pool_size = protected_pool_size
-        self.protected_channels = protected_pool_size if protected_channels is None else protected_channels
         if mask_fill not in {"learned", "zero"}:
             raise ValueError("mask_fill must be either 'learned' or 'zero'.")
         self.mask_fill_type = mask_fill
@@ -186,12 +224,13 @@ class PartitionAndBlockingModel(nn.Module):
         else:
             self.grid_h = max(height // 3, 1)
             self.grid_w = max(width // 3, 1)
-        if not isinstance(protected_pool_size, int) or protected_pool_size < 1:
-            raise ValueError("protected_pool_size must be a positive integer.")
         self.channels = channels
 
         self.protected_layers = ProtectedServerLayers(
-            channels, pooled_size=protected_pool_size, projected_channels=self.protected_channels
+            input_channels=channels,
+            output_dim=256,
+            r=protected_width,
+            pool_size=protected_pool_size,
         )
         self.original_layers = OriginalServerLayers(split_children=self.split_children)
         self.merging_layers = MergingLayers(protected_dim=256, original_dim=256, num_classes=num_classes)

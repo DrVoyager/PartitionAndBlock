@@ -237,6 +237,10 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=str, default="", help="Optional checkpoint for a trained PartitionAndBlockingModel.")
     parser.add_argument("--checkpoint-dir", type=str, default=str(DEFAULT_CHECKPOINT_DIR),
                         help="Directory to search for or save trained victim weights.")
+    parser.add_argument("--protected-width", type=float, default=1.0,
+                        help="Width multiplier for the protected convolutional encoder (default: 1.0).")
+    parser.add_argument("--protected-pool-size", type=int, default=2,
+                        help="Adaptive pooling side length for the protected encoder (default: 2).")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
@@ -246,7 +250,11 @@ def main() -> None:
     trainset = datasets.CIFAR10(args.data_root, download=True, train=True, transform=transform)
     testset = datasets.CIFAR10(args.data_root, download=True, train=False, transform=transform)
 
-    victim = PartitionAndBlockingModel(num_classes=args.num_classes).to(device)
+    victim = PartitionAndBlockingModel(
+        num_classes=args.num_classes,
+        protected_width=args.protected_width,
+        protected_pool_size=args.protected_pool_size,
+    ).to(device)
 
     if args.checkpoint:
         load_model_checkpoint(victim, Path(args.checkpoint), device)

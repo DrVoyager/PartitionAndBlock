@@ -64,6 +64,21 @@ For P&B MobileNetV1, `--mask-side M` sets the side length of the centered
 protected block. If omitted, the model uses the split-dependent default
 `height // 3`.
 
+The protected block is encoded by four standard convolutions followed by
+adaptive average pooling and a 256-dimensional linear projection. Two
+independent options control this encoder:
+
+- `--protected-width R` scales the convolutional channels from the base widths
+  `(32, 64, 128)` and rounds each result to a multiple of eight.
+- `--protected-pool-size P` retains a fixed `P x P` spatial representation
+  before the linear projection.
+
+The defaults are `R=1.0` and `P=2`. At the default stem split, the protected
+encoder receives `(B, 32, M, M)` and contains 380,864 trainable parameters.
+Its parameter count is independent of `M`. Existing checkpoints created with
+the previous depthwise/pointwise protected branch are not architecture
+compatible and must be retrained on this branch.
+
 Default stem/block-size-10 behavior:
 
 ```text
@@ -82,6 +97,8 @@ Train the default stem-split P&B MobileNetV1 model:
 
 ```bash
 python train.py \
+  --protected-width 1.0 \
+  --protected-pool-size 2 \
   --epochs 35 \
   --checkpoint-dir checkpoints \
   --checkpoint-name best_model.pth

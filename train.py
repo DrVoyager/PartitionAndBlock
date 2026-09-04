@@ -84,6 +84,10 @@ def main():
                         help="Low-level override: number of spatial MobileNetV1 feature children in the P&B client.")
     parser.add_argument("--mask-side", type=int, default=None,
                         help="Override the centered protected spatial mask side length. Omit to use the default split-dependent size.")
+    parser.add_argument("--protected-width", type=float, default=1.0,
+                        help="Width multiplier for the protected convolutional encoder (default: 1.0).")
+    parser.add_argument("--protected-pool-size", type=int, default=2,
+                        help="Adaptive pooling side length for the protected encoder (default: 2).")
     parser.add_argument("--require-cuda", action="store_true", help="Stop before running if CUDA is not available.")
     args = parser.parse_args()
 
@@ -127,10 +131,14 @@ def main():
         print(f'Split after depthwise block: {args.split_after_depthwise}')
     print(f'Client split children: {args.split_children}')
     print(f'Mask side: {args.mask_side if args.mask_side is not None else "default"}')
+    print(f'Protected encoder width: {args.protected_width}')
+    print(f'Protected encoder pool size: {args.protected_pool_size}')
     model = PartitionAndBlockingModel(
         num_classes=10,
         split_children=args.split_children,
         mask_side=args.mask_side,
+        protected_width=args.protected_width,
+        protected_pool_size=args.protected_pool_size,
     ).to(device)
     
     with torch.no_grad():
@@ -191,6 +199,8 @@ def main():
                 'split_preset': args.split_preset,
                 'split_after_depthwise': args.split_after_depthwise,
                 'mask_side': args.mask_side,
+                'protected_width': args.protected_width,
+                'protected_pool_size': args.protected_pool_size,
             }, checkpoint_path)
             print(f'  Best model saved with accuracy: {best_acc:.2f}%')
     
